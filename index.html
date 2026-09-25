@@ -4,10 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>DRM Protected Secure Video</title>
-    
+
     <!-- Load Google's Shaka Player library -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.7.7/shaka-player.compiled.js"></script>
-    
+
     <style>
         body {
             background-color: #121212;
@@ -20,7 +20,7 @@
             height: 100vh;
             margin: 0;
         }
-        
+
         #video-container {
             width: 100%;
             max-width: 800px;
@@ -40,7 +40,7 @@
             text-align: center;
             color: #ff4757;
         }
-        
+
         .note {
             font-size: 0.85em;
             color: #aaaaaa;
@@ -60,47 +60,156 @@
     </div>
 
     <script>
-        // 1. Wait for the page to load
-        document.addEventListener('DOMContentLoaded', initApp);
+    (function () {
+        'use strict';
 
-        function initApp() {
-            // Check if the browser supports Shaka Player (EME support)
-            shaka.polyfill.installAll();
-            if (shaka.Player.isBrowserSupported()) {
-                initPlayer();
-            } else {
-                alert('Browser not supported for secure video playback.');
+        /* ============================================================
+         *  1. CONFIGURATION
+         * ============================================================ */
+
+        // --- Akamai / Jio token that must go on EVERY CDN request ---
+        var HDNEA_PARAM = '__hdnea__';
+        var HDNEA_TOKEN = 'st=1790341305~exp=1790427705~acl=/*~hmac=a408979b15c46fc6ac5406985047cabb307b9cfd5ea93d4feda3599fe4785af4';
+        var HDNEA_QS    = HDNEA_PARAM + '=' + HDNEA_TOKEN;
+
+        // Only requests to these hosts get the token appended.
+        // Use [] (empty array) to decorate EVERY request instead.
+        var CDN_HOSTS = ['jiotvcod.cdn.jio.com'];
+
+        // Widevine license server (ExpressPlay / your backend)
+        var LICENSE_SERVER = 'http://localhost:5350/live/key/291';
+
+        // Base stream URL (no need to put __hdnea__ here - the filter adds it)
+        var VIDEO_URL = 'https://jiotvcod.cdn.jio.com/bpk-tv/Sony_HD_MOB/WDVCatchup/index.mpd' +
+                        '?begin=20260925T124000&end=20260925T133000';
+
+        /* ============================================================
+         *  2. TOKEN HELPERS
+         * ============================================================ */
+
+        function hostOf(uri) {
+            try {
+                return new URL(uri, window.location.href).hostname.toLowerCase();
+            } catch (e) {
+                return '';
             }
         }
 
-        async function initPlayer() {
-            const videoElement = document.getElementById('secure-video');
-            const player = new shaka.Player(videoElement);
+        function isCdnRequest(uri) {
+            if (!CDN_HOSTS.length) return true;             // no allow-list -> decorate all
+            var host = hostOf(uri);
+            if (!host) return false;
+            return CDN_HOSTS.some(function (h) {
+                h = h.toLowerCase();
+                return host === h || host.slice(-(h.length + 1)) === '.' + h;
+            });
+        }
 
-            // Listen for errors and log detailed information to console
-            player.addEventListener('error', (event) => {
-                console.error('Shaka Player Error:', event.detail.code, event.detail);
+        /**
+         * Returns the URI with a fresh __hdnea__ query parameter.
+         * The token value is appended VERBATIM (no percent-encoding),
+         * because Akamai validates the HMAC against the raw string.
+         */
+        function withHdnea(uri) {
+            if (!uri) return uri;
+
+            // --- split off the #fragment ---
+            var fragment = '';
+            var hashPos = uri.indexOf('#');
+            if (hashPos !== -1) {
+                fragment = uri.slice(hashPos);
+                uri = uri.slice(0, hashPos);
+            }
+
+            // --- split off the ?query ---
+            var path = uri, query = '';
+            var qPos = uri.indexOf('?');
+            if (qPos !== -1) {
+                path  = uri.slice(0, qPos);
+                query = uri.slice(qPos + 1);
+            }
+
+            // --- keep every param except old/stale __hdnea__ ones ---
+            var params = query
+                .split('&')
+                .filter(function (p) {
+                    return p.length > 0 && p.indexOf(HDNEA_PARAM + '=') !== 0;
+                });
+
+            // --- push the fresh token (last position, exactly like the CDN expects) ---
+            params.push(HDNEA_QS);
+
+            return path + '?' + params.join('&') + fragment;
+        }
+
+        /* ============================================================
+         *  3. PLAYER BOOTSTRAP
+         * ============================================================ */
+
+        document.addEventListener('DOMContentLoaded', initApp);
+
+        function initApp() {
+            shaka.polyfill.installAll();
+
+            if (!shaka.Player.isBrowserSupported()) {
+                alert('Browser not supported for secure video playback.');
+                return;
+            }
+
+            initPlayer().catch(function (err) {
+                console.error('Player init failed:', err);
+            });
+        }
+
+        async function initPlayer() {
+            var videoElement = document.getElementById('secure-video');
+            var player = new shaka.Player(videoElement);
+            window.player = player;   // handy for debugging in DevTools
+
+            // --- Global error listener ---
+            player.addEventListener('error', function (event) {
+                var detail = event.detail || {};
+                console.error('Shaka Player Error:', detail.code, detail);
             });
 
-            // Optional: If ExpressPlay or your backend requires custom HTTP Headers for the license request
-            /*
-            player.getNetworkingEngine().registerRequestFilter((type, request) => {
-                if (type == shaka.net.NetworkingEngine.RequestType.LICENSE) {
-                    // request.headers['Custom-Auth-Header'] = 'your-token-here';
+            /* ==========================================================
+             *  ⭐ THE KEY PART:
+             *  Append __hdnea__ to the manifest AND to every
+             *  segment / sub-request (init, audio, video, subtitles…)
+             * ========================================================== */
+            var netEngine = player.getNetworkingEngine();
+            var RT = shaka.net.NetworkingEngine.RequestType;
+
+            netEngine.registerRequestFilter(function (type, request) {
+                // Never touch DRM licence / certificate traffic
+                if (type === RT.LICENSE || type === RT.SERVER_CERTIFICATE) {
+                    return;
+                }
+
+                request.uris = request.uris.map(function (uri) {
+                    return isCdnRequest(uri) ? withHdnea(uri) : uri;
+                });
+            });
+
+            // --- Optional: log failing CDN requests (403 = expired token) ---
+            netEngine.registerResponseFilter(function (type, response) {
+                if ((type === RT.MANIFEST || type === RT.SEGMENT) && response.status >= 400) {
+                    console.warn('CDN request failed [' + response.status + ']', response.uri);
                 }
             });
-            */
 
-            // 2. CONFIGURE DRM (WIDEVINE L3)
+            /* ----------------------------------------------------------
+             *  DRM CONFIGURATION (WIDEVINE L3)
+             * ---------------------------------------------------------- */
             player.configure({
                 drm: {
                     servers: {
-                        // Ensure your ExpressPlay URL includes the ExpressPlayToken parameter
-                        'com.widevine.alpha': 'http://localhost:5350/live/key/291'
+                        // ExpressPlay / backend licence endpoint
+                        'com.widevine.alpha': LICENSE_SERVER
                     },
                     advanced: {
                         'com.widevine.alpha': {
-                            // This explicitly forces Widevine L3 (Software Decryption)
+                            // Force Widevine L3 (software decryption)
                             videoRobustness: 'SW_SECURE_CRYPTO',
                             audioRobustness: 'SW_SECURE_CRYPTO'
                         }
@@ -108,19 +217,20 @@
                 }
             });
 
-            // 3. LOAD THE ENCRYPTED VIDEO
-            const videoUrl = 'https://jiotvcod.cdn.jio.com/bpk-tv/Sony_HD_MOB/WDVCatchup/index.mpd?begin=20260925T124000&end=20260925T133000&__hdnea__=st=1790341305~exp=1790427705~acl=/*~hmac=a408979b15c46fc6ac5406985047cabb307b9cfd5ea93d4feda3599fe4785af4';
-
+            /* ----------------------------------------------------------
+             *  LOAD THE ENCRYPTED STREAM
+             * ---------------------------------------------------------- */
             try {
-                await player.load(videoUrl);
-                console.log('The Widevine L3 encrypted video has successfully loaded!');
+                await player.load(VIDEO_URL);
+                console.log('✅ Widevine L3 stream loaded. __hdnea__ applied to all CDN sub-requests.');
             } catch (e) {
                 console.error('Error loading video', e);
             }
         }
-        
+
         // Basic right-click protection for the web page
-        document.addEventListener('contextmenu', e => e.preventDefault());
+        document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+    })();
     </script>
 </body>
 </html>
